@@ -54,7 +54,7 @@ local AXES = {
     { label = "BP",  key = "bp"           },
     { label = "MP",  key = "metalStored"  },
     { label = "AV",  key = "armyValue"    },
-    { label = "Dmg", key = "dmgDealt"     },
+    { label = "DV",  key = "defValue"     },
 }
 local NUM_AXES = #AXES
 
@@ -69,9 +69,6 @@ local spGetTeamList      = Spring.GetTeamList
 local spGetPlayerList    = Spring.GetPlayerList
 local spGetPlayerInfo    = Spring.GetPlayerInfo
 local spGetTeamInfo      = Spring.GetTeamInfo
-local spGetTeamStatsHistory = Spring.GetTeamStatsHistory
-local spIsSpectator      = Spring.IsSpectator  -- may not exist in all versions
-local spGetSpectatingState = Spring.GetSpectatingState
 local spGetMouseState    = Spring.GetMouseState
 
 local glColor      = gl.Color
@@ -192,9 +189,9 @@ local function getActivePlayers()
 end
 
 local function collectStats(pd)
-    -- Per-team unit scan
-    local teamBP    = {}
-    local teamArmy  = {}
+    local teamBP   = {}
+    local teamArmy = {}
+    local teamDef  = {}
 
     local units = spGetAllUnits()
     for i = 1, #units do
@@ -204,42 +201,30 @@ local function collectStats(pd)
         if info then
             local hp, maxHp = spGetUnitHealth(uid)
             local frac = (hp and maxHp and maxHp > 0) and (hp / maxHp) or 1.0
-
-            teamBP[tid]   = (teamBP[tid]   or 0) + (info.isBP and info.bp or 0)
-            teamArmy[tid] = (teamArmy[tid] or 0)
-                + (info.isArmy and mfloor(info.cost * frac) or 0)
-                + (info.isDef  and mfloor(info.cost * frac) or 0)
+            teamBP[tid]   = (teamBP[tid]   or 0) + (info.isBP   and info.bp                      or 0)
+            teamArmy[tid] = (teamArmy[tid] or 0) + (info.isArmy and mfloor(info.cost * frac)      or 0)
+            teamDef[tid]  = (teamDef[tid]  or 0) + (info.isDef  and mfloor(info.cost * frac)      or 0)
         end
     end
 
     for _, p in ipairs(pd) do
         local tid = p.teamID
-        local mCur, mStore, _, mInc = spGetTeamResources(tid, "metal")
-        local _,    _,      _, eInc = spGetTeamResources(tid, "energy")
+        local mCur, _, _, mInc = spGetTeamResources(tid, "metal")
+        local _,   _, _, eInc  = spGetTeamResources(tid, "energy")
 
-        mCur  = mCur  or 0
-        mInc  = mInc  or 0
-        eInc  = eInc  or 0
-
-        -- Damage dealt: use GetTeamStatsHistory if available
-        local dmg = 0
-        if spGetTeamStatsHistory then
-            local hist = spGetTeamStatsHistory(tid, 0, 1)
-            if hist and hist[1] then
-                dmg = hist[1].damageDealt or 0
-            end
-        end
-
-        p.stats.metalIncome  = mfloor(mInc  * 10) / 10
-        p.stats.energyIncome = mfloor(eInc  * 10) / 10
+        p.stats.metalIncome  = mfloor((mInc or 0) * 10) / 10
+        p.stats.energyIncome = mfloor((eInc or 0) * 10) / 10
         p.stats.bp           = mfloor(teamBP[tid]   or 0)
-        p.stats.metalStored  = mfloor(mCur)
-        p.stats.armyValue    = teamArmy[tid] or 0
-        p.stats.dmgDealt     = mfloor(dmg)
+        p.stats.metalStored  = mfloor(mCur          or 0)
+        p.stats.armyValue    = teamArmy[tid]         or 0
+        p.stats.defValue     = teamDef[tid]          or 0
     end
 end
 
 local function updateAxisMaxima(pd)
+    -- Each axis scales to the maximum value across all displayed players.
+    -- This means the best player on each dimension always reaches the outer ring,
+    -- and everyone else is drawn proportionally.
     for ai, ax in ipairs(AXES) do
         local m = 1
         for _, p in ipairs(pd) do
@@ -251,11 +236,13 @@ local function updateAxisMaxima(pd)
 end
 
 local function sortAndTrim(pd)
-    -- Sort by armyValue desc, keep top maxPlayers
     table.sort(pd, function(a, b)
         return (a.stats.armyValue or 0) > (b.stats.armyValue or 0)
     end)
-    while #pd > CFG.maxPlayers do
+    -- Show at least 5 players when available, never more than maxPlayers
+    local keep = math.max(5, #pd)
+    if keep > CFG.maxPlayers then keep = CFG.maxPlayers end
+    while #pd > keep do
         table.remove(pd)
     end
 end
@@ -319,6 +306,47 @@ local function drawAxisLabels()
     end
 end
 
+-- Tiny scale value labels along each spoke at each ring intersection
+-- Rendered at a small fixed size, nudged slightly off-centre so they
+-- don't sit directly on the grid lines.
+local function drawScaleLabels()
+    local rings  = CFG.rings
+    local fs     = 8          -- tiny font
+    local nudge  = 5          -- px sideways offset from spoke
+    for ai = 1, NUM_AXES do
+        -- angle of this spoke
+        local angle = (2 * mpi * (ai - 1) / NUM_AXES) - mpi / 2
+        -- perpendicular nudge direction (rotate 90 degrees)
+        local px = -msin(angle) * nudge
+        local py =  mcos(angle) * nudge
+        for ring = 1, rings do
+            local frac = ring / rings
+            local r    = CFG.radius * frac
+            local sx   = CFG.cx + mcos(angle) * r + px
+            local sy   = CFG.cy + msin(angle) * r + py
+            -- Format the scale value for this ring on this axis
+            local maxV = axisMax[ai] or 1
+            local val  = maxV * frac
+            local label
+            if val >= 10000 then
+                label = string.format("%.0fk", val / 1000)
+            elseif val >= 1000 then
+                label = string.format("%.1fk", val / 1000)
+            elseif val >= 10 then
+                label = string.format("%.0f", val)
+            else
+                label = string.format("%.1f", val)
+            end
+            -- Shadow
+            glColor(0, 0, 0, 0.65)
+            glText(label, sx + 1, sy - 1, fs, "oc")
+            -- Label in silver/white
+            glColor(0.75, 0.78, 0.82, 0.90)
+            glText(label, sx, sy, fs, "oc")
+        end
+    end
+end
+
 local function drawPlayerPolygon(p, colorAlpha)
     local col = p.color
     -- Filled polygon (semi-transparent)
@@ -364,37 +392,31 @@ local function drawPlayerPolygon(p, colorAlpha)
     end
 end
 
-local function drawLegend()
+local function drawPlayerNames()
     if #playerData == 0 then return end
-    local lx = CFG.legendX
-    local ly = CFG.legendY
-    local fs = CFG.fontSize - 1
-    local rh = 22
-    local bw = 160
-    local bh = rh * #playerData + 16
-
-    -- Legend background
-    glColor(0.04, 0.05, 0.08, 0.78)
-    glRect(lx, ly, lx + bw, ly + bh)
-    glColor(0.28, 0.48, 0.78, 0.40)
-    glBeginEnd(GL_LINE_LOOP, function()
-        glVertex(lx,      ly)
-        glVertex(lx + bw, ly)
-        glVertex(lx + bw, ly + bh)
-        glVertex(lx,      ly + bh)
-    end)
-
-    local ty = ly + bh - 8 - fs
+    local fs    = CFG.fontSize - 1
+    local nameR = CFG.radius + CFG.labelOffset + 18
+    local n     = #playerData
+    -- Total slots = n players + 1 for "goddot", evenly distributed
+    local total = n + 1
     for i, p in ipairs(playerData) do
+        local angle = (2 * mpi * (i - 1) / total) - mpi / 2
+        local nx = CFG.cx + mcos(angle) * nameR
+        local ny = CFG.cy + msin(angle) * nameR
         local col = p.color
-        -- Colour swatch
-        glColor(col[1], col[2], col[3], 0.9)
-        glRect(lx + 8, ty + 2, lx + 22, ty + fs - 2)
-        -- Name
-        glColor(0.88, 0.90, 0.95, 1.0)
-        glText(p.name, lx + 28, ty, fs, "o")
-        ty = ty - rh
+        glColor(0, 0, 0, 0.7)
+        glText(p.name, nx + 1, ny - 1, fs, "oc")
+        glColor(col[1], col[2], col[3], 1.0)
+        glText(p.name, nx, ny, fs, "oc")
     end
+    -- "goddot" occupies the last slot, equidistant from all player names
+    local gangle = (2 * mpi * n / total) - mpi / 2
+    local gx = CFG.cx + mcos(gangle) * nameR
+    local gy = CFG.cy + msin(gangle) * nameR
+    glColor(0, 0, 0, 0.7)
+    glText("goddot", gx + 1, gy - 1, fs, "oc")
+    glColor(0.62, 0.65, 0.70, 0.85)
+    glText("goddot", gx, gy, fs, "oc")
 end
 
 local function drawBackground()
@@ -411,10 +433,8 @@ end
 -- ─── Widget callbacks ─────────────────────────────────────────────────────────
 
 local function updateLayout()
-    CFG.cx      = mfloor(screenW * 0.42)
-    CFG.cy      = mfloor(screenH * 0.50)
-    CFG.legendX = screenW - 185
-    CFG.legendY = screenH - 30 - 22 * CFG.maxPlayers
+    CFG.cx = screenW - 180
+    CFG.cy = mfloor(screenH * 0.50)
 end
 
 function widget:Initialize()
@@ -443,8 +463,8 @@ function widget:Update(dt)
 end
 
 function widget:DrawScreen()
-    if #playerData < CFG.minPlayers then
-        -- Not enough players — show a small hint
+    local n = #playerData
+    if n < 2 then
         glColor(0.60, 0.65, 0.73, 0.7)
         glText("FFA Radar HUD: waiting for 2+ players...",
                CFG.cx - 160, CFG.cy, CFG.fontSize, "o")
@@ -456,13 +476,14 @@ function widget:DrawScreen()
     drawBackground()
     drawGrid()
     drawAxisLabels()
+    drawScaleLabels()
 
     -- Draw all polygons back to front (last player drawn on top)
     for i = #playerData, 1, -1 do
         drawPlayerPolygon(playerData[i], CFG.lineAlpha)
     end
 
-    drawLegend()
+    drawPlayerNames()
 end
 
 -- ─── Dragging (move chart centre) ────────────────────────────────────────────
@@ -472,20 +493,18 @@ local dragOffX = 0
 local dragOffY = 0
 
 local function inChart(mx, my)
-    local fy  = screenH - my
-    local dx  = mx - CFG.cx
-    local dy  = fy - CFG.cy
-    local r   = CFG.radius + CFG.labelOffset + 10
+    local dx = mx - CFG.cx
+    local dy = my - CFG.cy
+    local r  = CFG.radius + CFG.labelOffset + 10
     return (dx*dx + dy*dy) <= (r*r)
 end
 
 function widget:MousePress(mx, my, btn)
     if btn ~= 1 then return false end
     if inChart(mx, my) then
-        local fy = screenH - my
         dragging = true
         dragOffX = mx - CFG.cx
-        dragOffY = fy - CFG.cy
+        dragOffY = my - CFG.cy
         return true
     end
     return false
@@ -493,9 +512,8 @@ end
 
 function widget:MouseMove(mx, my, dx, dy)
     if dragging then
-        local fy = screenH - my
         CFG.cx = mx - dragOffX
-        CFG.cy = fy - dragOffY
+        CFG.cy = my - dragOffY
     end
 end
 

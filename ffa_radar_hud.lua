@@ -7,7 +7,7 @@
 function widget:GetInfo()
     return {
         name    = "FFA Radar HUD",
-        desc    = "Spectator hexagon radar chart for top 2-6 FFA players",
+        desc    = "Spectator hexagon radar chart for top 2-6 FFA players — v2.1",
         author  = "goddot",
         date    = "2026",
         license = "GNU GPL v2",
@@ -46,7 +46,7 @@ local PLAYER_COLORS = {
 }
 
 -- ─── Axes: label, key into playerStats ────────────────────────────────────────
--- 6 axes evenly spaced, starting from top (M/s) going clockwise
+-- 7 axes evenly spaced, starting from top (M/s) going clockwise
 
 local AXES = {
     { label = "M/s", key = "metalIncome"  },
@@ -54,7 +54,7 @@ local AXES = {
     { label = "BP",  key = "bp"           },
     { label = "MP",  key = "metalStored"  },
     { label = "AV",  key = "armyValue"    },
-    { label = "DV",  key = "defValue"     },
+    { label = "Dmg", key = "dmgDealt"     },
 }
 local NUM_AXES = #AXES
 
@@ -65,6 +65,7 @@ local spGetUnitDefID     = Spring.GetUnitDefID
 local spGetUnitTeam      = Spring.GetUnitTeam
 local spGetUnitHealth    = Spring.GetUnitHealth
 local spGetTeamResources = Spring.GetTeamResources
+local spGetTeamDamageStats = Spring.GetTeamDamageStats
 local spGetTeamList      = Spring.GetTeamList
 local spGetPlayerList    = Spring.GetPlayerList
 local spGetPlayerInfo    = Spring.GetPlayerInfo
@@ -95,12 +96,20 @@ local udCache = {}   -- [udid] = { cost, isBP, isArmy, isDef, bp }
 local function classifyUnitDefs()
     for udid, ud in pairs(UnitDefs) do
         local cost = ud.metalCost or 0
-        local isBP, isArmy, isDef = false, false, false
+        local isBP, isArmy, isDef, isCmd = false, false, false, false
         local bp = 0
 
         if ud.buildSpeed and ud.buildSpeed > 0 then
             isBP = true
             bp   = ud.buildSpeed
+        end
+
+        -- Commander detection: check customParams.unitGroup or name pattern
+        local cp = ud.customParams
+        if cp and (cp.unitGroup == "commander" or cp.iscommander == "1") then
+            isCmd = true
+        elseif ud.name and ud.name:lower():find("commander") then
+            isCmd = true
         end
 
         local canAttack = ud.weapons and #ud.weapons > 0
@@ -109,9 +118,9 @@ local function classifyUnitDefs()
         if canAttack and isStatic and not isBP then isDef  = true end
         if canAttack and ud.canMove and ud.speed and ud.speed > 0 then isArmy = true end
 
-        if cost > 0 and (isBP or isArmy or isDef) then
+        if cost > 0 and (isBP or isArmy or isDef or isCmd) then
             udCache[udid] = { cost=cost, isBP=isBP, isArmy=isArmy,
-                              isDef=isDef, bp=bp }
+                              isDef=isDef, bp=bp, isCmd=isCmd }
         end
     end
 end
@@ -191,7 +200,7 @@ end
 local function collectStats(pd)
     local teamBP   = {}
     local teamArmy = {}
-    local teamDef  = {}
+    local teamCmd  = {}
 
     local units = spGetAllUnits()
     for i = 1, #units do
@@ -201,9 +210,11 @@ local function collectStats(pd)
         if info then
             local hp, maxHp = spGetUnitHealth(uid)
             local frac = (hp and maxHp and maxHp > 0) and (hp / maxHp) or 1.0
-            teamBP[tid]   = (teamBP[tid]   or 0) + (info.isBP   and info.bp                      or 0)
-            teamArmy[tid] = (teamArmy[tid] or 0) + (info.isArmy and mfloor(info.cost * frac)      or 0)
-            teamDef[tid]  = (teamDef[tid]  or 0) + (info.isDef  and mfloor(info.cost * frac)      or 0)
+            teamBP[tid]  = (teamBP[tid]  or 0) + (info.isBP   and info.bp                 or 0)
+            teamArmy[tid]= (teamArmy[tid] or 0) + (info.isArmy and mfloor(info.cost * frac) or 0)
+            if info.isCmd then
+                teamCmd[tid] = (teamCmd[tid] or 0) + 1
+            end
         end
     end
 
@@ -212,12 +223,19 @@ local function collectStats(pd)
         local mCur, _, _, mInc = spGetTeamResources(tid, "metal")
         local _,   _, _, eInc  = spGetTeamResources(tid, "energy")
 
+        local dmgDealt = 0
+        if spGetTeamDamageStats then
+            local d = spGetTeamDamageStats(tid)
+            if d then dmgDealt = d end
+        end
+
         p.stats.metalIncome  = mfloor((mInc or 0) * 10) / 10
         p.stats.energyIncome = mfloor((eInc or 0) * 10) / 10
-        p.stats.bp           = mfloor(teamBP[tid]   or 0)
-        p.stats.metalStored  = mfloor(mCur          or 0)
-        p.stats.armyValue    = teamArmy[tid]         or 0
-        p.stats.defValue     = teamDef[tid]          or 0
+        p.stats.bp           = mfloor(teamBP[tid]  or 0)
+        p.stats.metalStored  = mfloor(mCur         or 0)
+        p.stats.armyValue    = teamArmy[tid]        or 0
+        p.stats.dmgDealt     = mfloor(dmgDealt)
+        p.cmdCount           = teamCmd[tid]         or 0
     end
 end
 
@@ -397,26 +415,48 @@ local function drawPlayerNames()
     local fs    = CFG.fontSize - 1
     local nameR = CFG.radius + CFG.labelOffset + 18
     local n     = #playerData
-    -- Total slots = n players + 1 for "goddot", evenly distributed
+    -- Total slots = n players + 1 for the title block, evenly distributed
     local total = n + 1
     for i, p in ipairs(playerData) do
         local angle = (2 * mpi * (i - 1) / total) - mpi / 2
         local nx = CFG.cx + mcos(angle) * nameR
         local ny = CFG.cy + msin(angle) * nameR
         local col = p.color
+        -- Draw name at normal size
         glColor(0, 0, 0, 0.7)
         glText(p.name, nx + 1, ny - 1, fs, "oc")
         glColor(col[1], col[2], col[3], 1.0)
         glText(p.name, nx, ny, fs, "oc")
+        -- Commander count slightly larger, appended after name
+        if p.cmdCount and p.cmdCount > 0 then
+            local nameW = #p.name * fs * 0.55   -- rough pixel width estimate
+            local cx    = nx + nameW * 0.5 + 4
+            glColor(0, 0, 0, 0.7)
+            glText("("..p.cmdCount..")", cx + 1, ny - 1, fs + 2, "ol")
+            glColor(col[1], col[2], col[3], 1.0)
+            glText("("..p.cmdCount..")", cx, ny, fs + 2, "ol")
+        end
     end
-    -- "goddot" occupies the last slot, equidistant from all player names
+    -- Title block occupies the last slot, equidistant from all player names
     local gangle = (2 * mpi * n / total) - mpi / 2
     local gx = CFG.cx + mcos(gangle) * nameR
     local gy = CFG.cy + msin(gangle) * nameR
+    local lineH = fs + 2
+    -- "FFA Radar HUD" — brighter white
     glColor(0, 0, 0, 0.7)
-    glText("goddot", gx + 1, gy - 1, fs, "oc")
+    glText("FFA Radar HUD", gx + 1, gy + lineH - 1, fs, "oc")
+    glColor(0.88, 0.90, 0.95, 0.95)
+    glText("FFA Radar HUD", gx, gy + lineH, fs, "oc")
+    -- "Author: goddot" — silver
+    glColor(0, 0, 0, 0.6)
+    glText("Author: goddot", gx + 1, gy - 1, fs - 1, "oc")
     glColor(0.62, 0.65, 0.70, 0.85)
-    glText("goddot", gx, gy, fs, "oc")
+    glText("Author: goddot", gx, gy, fs - 1, "oc")
+    -- "Version 2.1" — dimmer silver
+    glColor(0, 0, 0, 0.5)
+    glText("Version 2.1", gx + 1, gy - lineH - 1, fs - 2, "oc")
+    glColor(0.50, 0.53, 0.58, 0.75)
+    glText("Version 2.1", gx, gy - lineH, fs - 2, "oc")
 end
 
 local function drawBackground()

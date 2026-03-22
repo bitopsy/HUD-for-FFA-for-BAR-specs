@@ -1,13 +1,13 @@
 -- ffa_radar_hud.lua
 -- Beyond All Reason — Spectator FFA radar HUD
 -- Shows a hexagon radar chart for the top 2-6 remaining players
--- Axes: M/s, E/s, BP, MP (metal stored), AV (army value), Dmg (damage dealt)
+-- Axes: M/s, E/s, BP, MP (metal stored), AV (army value), Dmg (damage dealt), DV (defense value)
 -- Place in: Beyond All Reason/LuaUI/Widgets/
 
 function widget:GetInfo()
     return {
         name    = "FFA Radar HUD",
-        desc    = "Spectator hexagon radar chart for top 2-6 FFA players — v2.1",
+        desc    = "Spectator hexagon radar chart for top 2-6 FFA players — v2.2",
         author  = "goddot",
         date    = "2026",
         license = "GNU GPL v2",
@@ -26,7 +26,7 @@ local CFG = {
     maxPlayers   = 6,
     minPlayers   = 2,
     bgAlpha      = 0.55,    -- radar background fill alpha
-    lineAlpha    = 0.85,    -- player polygon line alpha
+    lineAlpha      = 0.85,    -- player polygon line alpha
     fontSize     = 14,
     labelOffset  = 28,      -- extra px beyond radius for axis labels
     legendX      = 0,       -- set on init
@@ -55,6 +55,7 @@ local AXES = {
     { label = "MP",  key = "metalStored"  },
     { label = "AV",  key = "armyValue"    },
     { label = "Dmg", key = "dmgDealt"     },
+    { label = "DV",  key = "defenseValue" },
 }
 local NUM_AXES = #AXES
 
@@ -130,6 +131,7 @@ end
 local screenW   = 1280
 local screenH   = 768
 local timer     = 0
+local isPieMode = false
 
 -- playerData: array of { teamID, name, color, stats{} }
 local playerData = {}
@@ -187,7 +189,7 @@ local function getActivePlayers()
                 name   = name,
                 color  = col,
                 stats  = { metalIncome=0, energyIncome=0, bp=0,
-                           metalStored=0, armyValue=0, dmgDealt=0 },
+                           metalStored=0, armyValue=0, dmgDealt=0, defenseValue=0 },
             }
         end
     end
@@ -201,6 +203,7 @@ local function collectStats(pd)
     local teamBP   = {}
     local teamArmy = {}
     local teamCmd  = {}
+    local teamDef  = {}
 
     local units = spGetAllUnits()
     for i = 1, #units do
@@ -212,6 +215,7 @@ local function collectStats(pd)
             local frac = (hp and maxHp and maxHp > 0) and (hp / maxHp) or 1.0
             teamBP[tid]  = (teamBP[tid]  or 0) + (info.isBP   and info.bp                 or 0)
             teamArmy[tid]= (teamArmy[tid] or 0) + (info.isArmy and mfloor(info.cost * frac) or 0)
+            teamDef[tid] = (teamDef[tid]  or 0) + (info.isDef  and mfloor(info.cost * frac) or 0)
             if info.isCmd then
                 teamCmd[tid] = (teamCmd[tid] or 0) + 1
             end
@@ -235,6 +239,7 @@ local function collectStats(pd)
         p.stats.metalStored  = mfloor(mCur         or 0)
         p.stats.armyValue    = teamArmy[tid]        or 0
         p.stats.dmgDealt     = mfloor(dmgDealt)
+        p.stats.defenseValue = teamDef[tid]         or 0
         p.cmdCount           = teamCmd[tid]         or 0
     end
 end
@@ -410,6 +415,34 @@ local function drawPlayerPolygon(p, colorAlpha)
     end
 end
 
+-- Simplified Pie Chart drawing
+local function drawPieChart()
+    local totalAV = 0
+    for _, p in ipairs(playerData) do totalAV = totalAV + (p.stats.armyValue or 0) end
+    if totalAV <= 0 then return end
+    
+    local currentAngle = -mpi / 2
+    for _, p in ipairs(playerData) do
+        local val = p.stats.armyValue or 0
+        if val > 0 then
+            local slice = (val / totalAV) * 2 * mpi
+            local col = p.color
+            glColor(col[1], col[2], col[3], 0.7)
+            glBeginEnd(GL_POLYGON, function()
+                glVertex(CFG.cx, CFG.cy)
+                for a = 0, 20 do
+                    local ang = currentAngle + (a / 20) * slice
+                    glVertex(CFG.cx + mcos(ang)*CFG.radius, CFG.cy + msin(ang)*CFG.radius)
+                end
+            end)
+            currentAngle = currentAngle + slice
+        end
+    end
+    -- Draw text over for pie chart
+    glColor(1, 1, 1, 1.0)
+    glText("Army Value Distribution", CFG.cx, CFG.cy + CFG.radius + 10, CFG.fontSize, "oc")
+end
+
 local function drawPlayerNames()
     if #playerData == 0 then return end
     local fs    = CFG.fontSize - 1
@@ -452,11 +485,11 @@ local function drawPlayerNames()
     glText("Author: goddot", gx + 1, gy - 1, fs - 1, "oc")
     glColor(0.62, 0.65, 0.70, 0.85)
     glText("Author: goddot", gx, gy, fs - 1, "oc")
-    -- "Version 2.1" — dimmer silver
+    -- "Version 2.2" — dimmer silver
     glColor(0, 0, 0, 0.5)
-    glText("Version 2.1", gx + 1, gy - lineH - 1, fs - 2, "oc")
+    glText("Version 2.2", gx + 1, gy - lineH - 1, fs - 2, "oc")
     glColor(0.50, 0.53, 0.58, 0.75)
-    glText("Version 2.1", gx, gy - lineH, fs - 2, "oc")
+    glText("Version 2.2", gx, gy - lineH, fs - 2, "oc")
 end
 
 local function drawBackground()
@@ -502,6 +535,14 @@ function widget:Update(dt)
     end
 end
 
+function widget:KeyPress(key)
+    if key == 0x20 then -- Spacebar
+        isPieMode = not isPieMode
+        return true
+    end
+    return false
+end
+
 function widget:DrawScreen()
     local n = #playerData
     if n < 2 then
@@ -514,13 +555,17 @@ function widget:DrawScreen()
     gl.LineWidth(1.0)
 
     drawBackground()
-    drawGrid()
-    drawAxisLabels()
-    drawScaleLabels()
-
-    -- Draw all polygons back to front (last player drawn on top)
-    for i = #playerData, 1, -1 do
-        drawPlayerPolygon(playerData[i], CFG.lineAlpha)
+    
+    if isPieMode then
+        drawPieChart()
+    else
+        drawGrid()
+        drawAxisLabels()
+        drawScaleLabels()
+        -- Draw all polygons back to front (last player drawn on top)
+        for i = #playerData, 1, -1 do
+            drawPlayerPolygon(playerData[i], CFG.lineAlpha)
+        end
     end
 
     drawPlayerNames()
